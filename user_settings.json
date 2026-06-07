@@ -1,0 +1,14 @@
+{
+  "overlay_enabled": false,
+  "overlay_opacity": 85,
+  "show_ban_recommendations": true,
+  "show_pick_recommendations": true,
+  "panel_x": 20,
+  "panel_y": 200,
+  "language": "ru",
+  "card_scale": 100,
+  "show_detailed_tooltip": true,
+  "hotkey_hide_overlay": "Ctrl+H",
+  "hotkey_open_settings": "Ctrl+Shift+S",
+  "tesseract_cmd": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+}

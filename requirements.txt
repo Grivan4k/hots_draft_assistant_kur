@@ -1,0 +1,5 @@
+# HotS Draft Assistant — dependencies (Python 3.9+)
+# Install: pip install -r requirements.txt
+
+# Desktop window and in-game overlay
+PyQt5==5.15.9
