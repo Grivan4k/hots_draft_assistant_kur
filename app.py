@@ -425,16 +425,20 @@ class MainWindow(QMainWindow):
         self.demo2_btn = QPushButton("🎬 Демо 2")
         self.demo1_btn.setToolTip("2 игрока слева, 3 справа, по 3 бана")
         self.demo2_btn.setToolTip("По 2 бана с каждой стороны, 1 пик слева, 1 пик справа")
+        self.import_btn = QPushButton("📥 Импорт статистики")
+        self.import_btn.setToolTip("Загрузить статистику из JSON-файлов реплеев в базу данных")
         self.sett_btn = QPushButton("⚙ Настройки")
         self.ovrl_chk = QtWidgets.QCheckBox("Оверлей")
         self.ovrl_chk.setChecked(self.settings.get("overlay_enabled", True))
         self.demo1_btn.clicked.connect(lambda: self._run_demo(1))
         self.demo2_btn.clicked.connect(lambda: self._run_demo(2))
+        self.import_btn.clicked.connect(self.import_stats)
         self.sett_btn.clicked.connect(self.open_settings)
         self.ovrl_chk.toggled.connect(self.toggle_overlay)
         h.addWidget(title)
         h.addStretch()
-        for w in (self.demo1_btn, self.demo2_btn, self.sett_btn, self.ovrl_chk):
+        for w in (self.demo1_btn, self.demo2_btn, self.import_btn,
+                  self.sett_btn, self.ovrl_chk):
             h.addWidget(w)
         return h
 
@@ -502,7 +506,16 @@ class MainWindow(QMainWindow):
         calc_btn.clicked.connect(self._calculate)
 
         reset_btn = QPushButton("↺ Сброс")
-        reset_btn.clicked.connect(self._reset_all)
+        reset_btn.clicked.connect(self._reset_all_confirm)
+
+        finish_btn = QPushButton("🏁 Закончить игру")
+        finish_btn.setToolTip("Сохранить текущий матч в базу данных")
+        finish_btn.setStyleSheet(
+            "QPushButton{background:#2A2A3A;border:1px solid #4A4A6A;"
+            "color:#9A9ACA;font-size:11px;border-radius:5px;padding:6px 10px;}"
+            "QPushButton:hover{background:#34344A;}"
+        )
+        finish_btn.clicked.connect(self._finish_game)
 
         self.ally_mmr_lbl = QLabel("—")
         self.ally_mmr_lbl.setAlignment(Qt.AlignCenter)
@@ -526,7 +539,7 @@ class MainWindow(QMainWindow):
         self.prob_bar.setFormat("%p%")
         self.prob_bar.setFixedHeight(20)
 
-        for w in (calc_btn, reset_btn):
+        for w in (calc_btn, reset_btn, finish_btn):
             ctr.addWidget(w)
         ctr.addSpacing(16)
         for w in (self.ally_mmr_lbl, vs_lbl, self.enemy_mmr_lbl,
@@ -612,6 +625,18 @@ class MainWindow(QMainWindow):
         for i, s in enumerate(self.ally_slots):
             s.set_me(i == idx)
 
+    def _reset_all_confirm(self):
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Подтверждение сброса")
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setText("Сбросить весь введённый состав матча?")
+        yes = box.addButton("Сбросить", QtWidgets.QMessageBox.AcceptRole)
+        box.addButton("Отмена", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(box.buttons()[-1])
+        box.exec_()
+        if box.clickedButton() is yes:
+            self._reset_all()
+
     def _reset_all(self):
         for s in self.ally_slots + self.enemy_slots:
             s.player = ""; s.hero = ""; s.grade = ""; s.is_otp = False
@@ -624,6 +649,68 @@ class MainWindow(QMainWindow):
         self.ally_mmr_lbl.setText("—")
         self.enemy_mmr_lbl.setText("—")
         self._log("Сброс.")
+
+    # ── Finish game → save match to DB ─────────────────────────────────────────
+    def _finish_game(self):
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Закончить игру")
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setText("Кто победил в этом матче?")
+        ally = box.addButton("Моя команда", QtWidgets.QMessageBox.AcceptRole)
+        enemy = box.addButton("Команда противника", QtWidgets.QMessageBox.AcceptRole)
+        box.addButton("Отмена", QtWidgets.QMessageBox.RejectRole)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked not in (ally, enemy):
+            return
+        winner = "ally" if clicked is ally else "enemy"
+        match = self._build_match(winner)
+        if match is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Закончить игру",
+                "Не заполнены игроки и герои — матч не сохранён.")
+            return
+        res = self.engine.import_matches_dict([match])
+        if res["errors"]:
+            self._log(f"Матч не сохранён: {res['errors'][0][1]}")
+            QtWidgets.QMessageBox.warning(self, "Закончить игру",
+                                          "Не удалось сохранить матч.")
+            return
+        self._log(f"Матч сохранён ({'победа' if winner=='ally' else 'поражение'}), "
+                  f"игроков: {len(match['players'])}.")
+        QtWidgets.QMessageBox.information(
+            self, "Закончить игру",
+            f"Матч добавлен в базу данных.\nПобедитель: "
+            f"{'моя команда' if winner=='ally' else 'команда противника'}.")
+        self._calculate()
+
+    def _build_match(self, winner: str):
+        """Assemble a match document from the current draft state."""
+        from datetime import datetime
+        map_name = self.map_combo.currentText() or None
+        players = []
+        for team, slots in (("ally", self.ally_slots), ("enemy", self.enemy_slots)):
+            for s in slots:
+                if not s.player or not s.hero:
+                    continue
+                role = None
+                row = self.engine.db.conn.execute(
+                    "SELECT hero_role FROM Hero WHERE hero_name = ?", (s.hero,)).fetchone()
+                if row:
+                    role = row["hero_role"]
+                players.append({
+                    "battletag": s.player, "team": team, "hero": s.hero,
+                    "role": role, "is_winner": (team == winner),
+                    "kills": 0, "deaths": 0, "assists": 0,
+                })
+        if not players:
+            return None
+        bans = [b.hero for b in self.ally_bans + self.enemy_bans if b.hero]
+        return {
+            "match_id": "manual_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S"),
+            "map_name": map_name, "game_mode": "manual",
+            "players": players, "bans": bans,
+        }
 
     # ── Calculate ──────────────────────────────────────────────────────────────
     def _calculate(self):
@@ -703,6 +790,30 @@ class MainWindow(QMainWindow):
         self._calculate()
 
     # ── Overlay / Settings ─────────────────────────────────────────────────────
+    # ── Data import ────────────────────────────────────────────────────────────
+    def import_stats(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Выберите JSON-файлы статистики реплеев",
+            "", "JSON (*.json);;Все файлы (*.*)")
+        if not paths:
+            return
+        result = self.engine.import_matches(paths)
+        msg = (f"Импортировано файлов: {result['files']}, "
+               f"матчей: {result['matches']}.")
+        if result["errors"]:
+            msg += f"\nОшибок: {len(result['errors'])}"
+        self._log(msg)
+        for name, err in result["errors"]:
+            self._log(f"  ! {name}: {err}")
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Импорт статистики")
+        box.setText(msg)
+        box.setIcon(QtWidgets.QMessageBox.Information
+                    if not result["errors"] else QtWidgets.QMessageBox.Warning)
+        box.exec_()
+        # Recompute so freshly imported profiles are reflected immediately.
+        self._calculate()
+
     def toggle_overlay(self, enabled: bool):
         self.settings["overlay_enabled"] = enabled
         overlay.save_settings(self.settings)

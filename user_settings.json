@@ -1,5 +1,5 @@
 {
-  "overlay_enabled": false,
+  "overlay_enabled": true,
   "overlay_opacity": 85,
   "show_ban_recommendations": true,
   "show_pick_recommendations": true,

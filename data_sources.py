@@ -164,36 +164,67 @@ def import_from_replay_parser(db: Database, parsed_matches) -> int:
     """
     from datetime import datetime
     imported = 0
+    affected = set()
     for match in parsed_matches:
         mid = match["match_id"]
+        map_name = match.get("map_name")
+        # Ensure referenced rows exist so foreign keys are satisfied
+        # (Match.map_name -> MapStats.map_name).
+        if map_name:
+            db.conn.execute(
+                "INSERT OR IGNORE INTO MapStats (map_name) VALUES (?)", (map_name,))
         db.conn.execute(
             "INSERT OR REPLACE INTO Match (match_id, map_name, game_mode, match_date) "
             "VALUES (?, ?, ?, ?)",
-            (mid, match.get("map_name"), match.get("game_mode"),
-             datetime.utcnow().isoformat()),
+            (mid, map_name, match.get("game_mode"), datetime.utcnow().isoformat()),
         )
         for p in match.get("players", []):
             tag = p["battletag"]
+            hero = p.get("hero")
             db.upsert_player(tag)
+            # Ensure the hero exists (PlayerMatch.hero_played -> Hero.hero_name).
+            if hero:
+                db.conn.execute(
+                    "INSERT OR IGNORE INTO Hero (hero_name, hero_role) VALUES (?, ?)",
+                    (hero, p.get("role") or "Unknown"))
+            # PlayerMatch is keyed by (player_battletag, match_id); INSERT OR
+            # REPLACE makes re-importing the same match idempotent (no dupes).
             db.conn.execute(
                 """INSERT OR REPLACE INTO PlayerMatch
                    (player_battletag, match_id, hero_played, role_played, team,
                     is_winner, kills, deaths, assists)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (tag, mid, p.get("hero"), p.get("role"), p.get("team"),
-                 int(p.get("is_winner", False)),
-                 p.get("kills", 0), p.get("deaths", 0), p.get("assists", 0)),
+                (tag, mid, hero, p.get("role"), p.get("team"),
+                 int(bool(p.get("is_winner"))),
+                 int(p.get("kills") or 0), int(p.get("deaths") or 0),
+                 int(p.get("assists") or 0)),
             )
-            hero = p.get("hero")
-            if hero:
-                row = db.conn.execute(
-                    "SELECT games_played, wins, losses FROM PlayerHeroStats "
-                    "WHERE player_battletag=? AND hero_name=?", (tag, hero)
-                ).fetchone()
-                g = (row["games_played"] if row else 0) + 1
-                w = (row["wins"]         if row else 0) + int(p.get("is_winner", False))
-                l = (row["losses"]       if row else 0) + int(not p.get("is_winner", False))
-                db.upsert_hero_stats(tag, hero, games_played=g, wins=w, losses=l)
+            affected.add(tag)
         db.conn.commit()
         imported += 1
+
+    # Recompute per-hero and overall aggregates from PlayerMatch (the source of
+    # truth). Deriving rather than incrementing keeps imports idempotent: re-
+    # importing the same match does not inflate any counters.
+    for tag in affected:
+        _recompute_player_aggregates(db, tag)
+    db.conn.commit()
     return imported
+
+
+def _recompute_player_aggregates(db: Database, battletag: str) -> None:
+    """Rebuild PlayerHeroStats and Player totals for one player from PlayerMatch."""
+    win = "COALESCE(SUM(CASE WHEN is_winner THEN 1 ELSE 0 END), 0)"
+    rows = db.conn.execute(
+        f"SELECT hero_played AS hero, COUNT(*) AS g, {win} AS w "
+        "FROM PlayerMatch WHERE player_battletag = ? AND hero_played IS NOT NULL "
+        "GROUP BY hero_played", (battletag,)).fetchall()
+    for r in rows:
+        g, w = r["g"], r["w"]
+        db.upsert_hero_stats(battletag, r["hero"],
+                             games_played=g, wins=w, losses=g - w)
+    tot = db.conn.execute(
+        f"SELECT COUNT(*) AS g, {win} AS w FROM PlayerMatch "
+        "WHERE player_battletag = ?", (battletag,)).fetchone()
+    g, w = tot["g"], tot["w"]
+    db.upsert_player(battletag, total_games=g, total_wins=w, total_losses=g - w)

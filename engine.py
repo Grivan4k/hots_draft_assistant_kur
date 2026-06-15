@@ -7,9 +7,12 @@ from __future__ import annotations
 import uuid
 from typing import Dict, List, Optional
 
+import json
+import os
+
 import config
 from analytics import PlayerAnalyzer, TeamComparator
-from data_sources import seed_hero_roster
+from data_sources import import_from_replay_parser, seed_hero_roster
 from db import Database
 from recommendations import BanAdvisor, PickAdvisor
 
@@ -99,6 +102,46 @@ class DraftAssistant:
     def player_profile(self, battletag: str):
         return self.analyzer.build_profile(battletag)
 
+    # ── Data import (replay-derived JSON → local database) ──────────────────
+    @staticmethod
+    def _matches_from_file(path: str) -> List[Dict]:
+        """Read one *.import.json (or all_drafts.json) into a list of matches."""
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            if "drafts" in data and isinstance(data["drafts"], list):
+                return data["drafts"]          # combined all_drafts.json
+            return [data]                       # single match document
+        return []
+
+    def import_matches_dict(self, matches: List[Dict]) -> Dict:
+        """Import a list of match dictionaries into the local database."""
+        try:
+            n = import_from_replay_parser(self.db, matches)
+            return {"files": 0, "matches": n, "errors": []}
+        except Exception as e:
+            return {"files": 0, "matches": 0, "errors": [("<data>", str(e))]}
+
+    def import_matches(self, paths) -> Dict:
+        """Import match JSON file(s) into the local database (no external DBMS).
+
+        Accepts a path or list of paths to files produced by the replay tool.
+        Returns {'files': n, 'matches': n, 'errors': [(path, message), ...]}.
+        """
+        if isinstance(paths, str):
+            paths = [paths]
+        total_files, total_matches, errors = 0, 0, []
+        for path in paths:
+            try:
+                matches = self._matches_from_file(path)
+                total_matches += import_from_replay_parser(self.db, matches)
+                total_files += 1
+            except Exception as e:  # malformed JSON, missing keys, etc.
+                errors.append((os.path.basename(path), str(e)))
+        return {"files": total_files, "matches": total_matches, "errors": errors}
+
     def close(self) -> None:
         if self.session_id:
             self.db.complete_draft_session(self.session_id)
@@ -133,7 +176,7 @@ def scenario_1(assistant: "DraftAssistant") -> dict:
     return {
         "map": "Cursed Hollow",
         "me_slot": 4,
-        "ally":  [(0, "Dynouh#1234", ""), (4, "", "")],
+        "ally":  [(0, "Dynouh#1234", ""), (4, "Hasu#2222", "")],
         "enemy": [(0, "EnemyOTP#5555", ""), (1, "Smokey#6666", ""), (2, "Cara#7777", "")],
         "ally_bans":  ["Illidan", "Alexstrasza", "Thrall"],   # ban enemy signature heroes
         "enemy_bans": ["Li-Ming", "Jaina", "Kael'thas"],      # enemy bans our carry's pool
